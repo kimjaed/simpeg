@@ -1,12 +1,16 @@
 from __future__ import print_function
-from . import Utils
+
 import numpy as np
 import scipy.sparse as sp
 from six import string_types
+
 from .Utils.SolverUtils import *
+from . import Utils
+
 norm = np.linalg.norm
-from SimPEG import Regularization
+
 from time import time
+
 
 __all__ = [
     'Minimize', 'Remember', 'SteepestDescent', 'BFGS', 'GaussNewton',
@@ -160,6 +164,14 @@ class IterationPrinters(object):
         "title": "phi_m", "value": lambda M: M.parent.phi_m, "width": 10,
         "format":   "%1.2e"
     }
+    iterationCG = {
+        "title": "iterCG", "value": lambda M: M.cg_count, "width": 10, 
+        "format": "%3d"
+    }
+    ratioX = {
+        "title": "ratio_x", "value": lambda M: norm(M.xc - M.x_last)/norm(M.x_last), 
+        "width": 10, "format": "%1.2e"
+    }
 
 
 class Minimize(object):
@@ -187,8 +199,6 @@ class Minimize(object):
     comment = ''  #: Used by some functions to indicate what is going on in the algorithm
     counter = None  #: Set this to a SimPEG.Utils.Counter() if you want to count things
     parent = None  #: This is the parent of the optimization routine.
-    silent = False
-    LSalwaysPass = False
 
     def __init__(self, **kwargs):
         self.stoppers = [
@@ -220,7 +230,7 @@ class Minimize(object):
         if self.callback is not None:
             print(
                 'The callback on the {0!s} Optimization was '
-                'replaced.'.format(self.__name__)
+                'replaced.'.format(self.__class__.__name__)
             )
         self._callback = value
 
@@ -273,17 +283,14 @@ class Minimize(object):
         """
         self.evalFunction = evalFunction
         self.startup(x0)
-
-        if not self.silent:
-            self.printInit()
-            print('x0 has any nan: {:b}'.format(np.any(np.isnan(x0))))
+        self.printInit()
+        print('x0 has any nan: {:b}'.format(np.any(np.isnan(x0))))
         while True:
             self.doStartIteration()
             self.f, self.g, self.H = evalFunction(
                 self.xc, return_g=True, return_H=True
             )
-            if not self.silent:
-                self.printIter()
+            self.printIter()
             if self.stoppingCriteria():
                 break
             self.searchDirection = self.findSearchDirection()
@@ -297,8 +304,8 @@ class Minimize(object):
             self.doEndIteration(xt)
             if self.stopNextIteration:
                 break
-        if not self.silent:
-            self.printDone()
+
+        self.printDone()
         self.finish()
 
         return self.xc
@@ -519,11 +526,7 @@ class Minimize(object):
         if self.debugLS and self.iterLS > 0:
             self.printDone(inLS=True)
 
-        if np.all([self.LSalwaysPass, self.iterLS >= self.maxIterLS]):
-            print("LS forced to continue")
-            return self._LS_xt, True
-        else:
-            return self._LS_xt, self.iterLS < self.maxIterLS
+        return self._LS_xt, self.iterLS < self.maxIterLS
 
     @Utils.count
     def modifySearchDirectionBreak(self, p):
@@ -1065,36 +1068,23 @@ class ProjectedGNCG(BFGS, Minimize, Remember):
 
     def __init__(self, **kwargs):
         Minimize.__init__(self, **kwargs)
-        BFGS.__init__(self, **kwargs)
 
     name = 'Projected GNCG'
 
     maxIterCG = 5
     tolCG = 1e-1
-    cgCount = 0
-
-    # perturbation of the inactive set off the bounds
-    stepOffBoundsFact = 1e-8
-    lower = [-np.inf]
-    upper = [np.inf]
-
-    ComboObjFun = False
-    LSalwaysPass = False
-
+    cg_count = 0
+    stepOffBoundsFact = 1e-2 # perturbation of the inactive set off the bounds
+    stepActiveset = True
+    lower = -np.inf
+    upper = np.inf
 
     def _startup(self, x0):
-
         # ensure bound vectors are the same size as the model
         if type(self.lower) is not np.ndarray:
-
             self.lower = np.ones_like(x0)*self.lower
-
         if type(self.upper) is not np.ndarray:
-
             self.upper = np.ones_like(x0)*self.upper
-
-        assert self.lower.shape[0] == x0.shape[0], "Lower bound must be a list or vector"
-        assert self.upper.shape[0] == x0.shape[0], "Upper bound must be a list or vector"
 
     @Utils.count
     def projection(self, x):
@@ -1137,41 +1127,43 @@ class ProjectedGNCG(BFGS, Minimize, Remember):
 
     @Utils.timeIt
     def findSearchDirection(self):
-
         """
             findSearchDirection()
-            Finds the search direction based on either CG or steepest descent.
+            Finds the search direction based on projected CG
         """
+        self.cg_count = 0
         Active = self.activeSet(self.xc)
         temp = sum((np.ones_like(self.xc.size)-Active))
-        allBoundsAreActive = temp == self.xc.size
 
-        delx = np.zeros(self.g.size)
+        step = np.zeros(self.g.size)
         resid = -(1-Active) * self.g
 
-        # Currently not fully dask parallel as resid and H*x seperate operations
-        r = np.asarray(resid - (1-Active)*(self.H * delx))
-
+        r = (resid - (1-Active)*(self.H * step))
+        r0 = r.copy()
 
         p = self.approxHinv*r
 
         sold = np.dot(r, p)
-        s0 = sold
 
         count = 0
         print("Start CG solve")
         tc = time()
-        while np.all([np.linalg.norm(r) > self.tolCG, count < self.maxIterCG]):
-
+        for i in range(self.maxIterCG):
+#            print("i: ", i)
+#            t_cg = time()
             count += 1
 
-            q = np.asarray((1-Active)*(self.H * p))
+            q = (1-Active)*(self.H * p)
 
             alpha = sold / (np.dot(p, q))
 
-            delx += alpha * p
+            step += alpha * p
 
             r -= alpha * q
+            
+#            print("r.dot(r) / r0.dot(r0): ", r.dot(r) / r0.dot(r0))
+            if r.dot(r) / r0.dot(r0) < self.tolCG:
+                break
 
             h = self.approxHinv * r
 
@@ -1180,28 +1172,29 @@ class ProjectedGNCG(BFGS, Minimize, Remember):
             p = h + (snew / sold * p)
 
             sold = snew
-
+#            print("time for one CG iteration: ", time() - t_cg)
             # End CG Iterations
-        self.cgCount += count
+        self.cg_count += count
         print("CG solve time: " + str(time()-tc))
+
         # Take a gradient step on the active cells if exist
         if temp != self.xc.size:
 
-            rhs_a = np.asarray((Active) * -self.g)
+            rhs_a = (Active) * -self.g
 
-            dm_i = max(abs(delx))
+            dm_i = max(abs(step))
             dm_a = max(abs(rhs_a))
 
             # perturb inactive set off of bounds so that they are included
             # in the step
-            delx = delx + self.stepOffBoundsFact * (rhs_a * dm_i / dm_a)
+            step = step + self.stepOffBoundsFact * (rhs_a * dm_i / dm_a)
 
         # Only keep gradients going in the right direction on the active
         # set
         indx = (
-            ((self.xc <= self.lower) & (delx < 0)) |
-            ((self.xc >= self.upper) & (delx > 0))
+            ((self.xc <= self.lower) & (step < 0)) |
+            ((self.xc >= self.upper) & (step > 0))
         )
-        delx[indx] = 0.
+        step[indx] = 0.
 
-        return delx
+        return step

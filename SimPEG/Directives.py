@@ -1,20 +1,19 @@
 from __future__ import print_function
-from . import Utils
-import scipy.sparse as sp
-import dask.array as da
-from . import Regularization, DataMisfit, ObjectiveFunction
-from . import Maps
+
+import properties
 import numpy as np
+norm = np.linalg.norm
 import matplotlib.pyplot as plt
 import warnings
+import os
+
+from . import Utils
+from . import Regularization, DataMisfit, ObjectiveFunction, Optimization
 from . import Maps
-from .PF import Magnetics, MagneticsDriver
-from . import Regularization
-from . import Mesh
-from . import ObjectiveFunction
+from .Utils import mkvc
 
 
-class InversionDirective(object):
+class InversionDirective(properties.HasProperties):
     """InversionDirective"""
 
     debug = False    #: Print debugging information
@@ -191,26 +190,22 @@ class BetaEstimate_ByEig(InversionDirective):
         """
             The initial beta is calculated by comparing the estimated
             eigenvalues of JtJ and WtW.
-
             To estimate the eigenvector of **A**, we will use one iteration
             of the *Power Method*:
 
             .. math::
-
                 \mathbf{x_1 = A x_0}
 
             Given this (very course) approximation of the eigenvector, we can
             use the *Rayleigh quotient* to approximate the largest eigenvalue.
 
             .. math::
-
                 \lambda_0 = \\frac{\mathbf{x^\\top A x}}{\mathbf{x^\\top x}}
 
             We will approximate the largest eigenvalue for both JtJ and WtW,
             and use some ratio of the quotient to estimate beta0.
 
             .. math::
-
                 \\beta_0 = \gamma \\frac{\mathbf{x^\\top J^\\top J x}}{\mathbf{x^\\top W^\\top W x}}
 
             :rtype: float
@@ -223,11 +218,22 @@ class BetaEstimate_ByEig(InversionDirective):
         m = self.invProb.model
         f = self.invProb.getFields(m, store=True, deleteWarmstart=False)
 
-        x0 = np.random.rand(m.shape[0])
-        t = np.dot(x0, self.dmisfit.deriv2(m, x0, f=f))
-        b = np.dot(x0, self.reg.deriv2(m, v=x0))
-        self.beta0 = self.beta0_ratio*(t/b)
+        # Fix the seed for random vector for consistent result
+        np.random.seed(1)
+        x0 = np.random.rand(*m.shape)
 
+        t, b = 0, 0
+        i_count = 0
+        for dmis, reg in zip(self.dmisfit.objfcts, self.reg.objfcts):
+            # check if f is list
+            if len(self.dmisfit.objfcts) > 1:
+                t += x0.dot(dmis.deriv2(m, x0, f=f[i_count]))
+            else:
+                t += x0.dot(dmis.deriv2(m, x0, f=f))
+            b += x0.dot(reg.deriv2(m, v=x0))
+            i_count += 1
+
+        self.beta0 = self.beta0_ratio*(t/b)
         self.invProb.beta = self.beta0
 
 
@@ -248,7 +254,9 @@ class BetaSchedule(InversionDirective):
 
 
 class TargetMisfit(InversionDirective):
-
+    """
+    ... note:: Currently the target misfit is not set up for joint inversions. Get `in touch <https://github.com/simpeg/simpeg/issues/new>`_ if you would like to help with the upgrade!
+    """
     chifact = 1.
     phi_d_star = None
 
@@ -277,16 +285,30 @@ class TargetMisfit(InversionDirective):
 
 
 class SaveEveryIteration(InversionDirective):
+    """SaveEveryIteration
 
-    @property
-    def name(self):
-        if getattr(self, '_name', None) is None:
-            self._name = 'InversionModel'
-        return self._name
+    This directive saves an array at each iteration. The default
+    direcroty is the current directoy and the models are saved as
+    `InversionModel-YYYY-MM-DD-HH-MM-iter.npy`
+    """
 
-    @name.setter
-    def name(self, value):
-        self._name = value
+    directory = properties.String(
+        "directory to save results in",
+        default = "."
+    )
+
+    name = properties.String(
+        "root of the filename to be saved",
+        default="InversionModel"
+    )
+
+    @properties.validator('directory')
+    def _ensure_abspath(self, change):
+        val = change['value']
+        fullpath = os.path.abspath(os.path.expanduser(val))
+
+        if not os.path.isdir(fullpath):
+            os.mkdir(fullpath)
 
     @property
     def fileName(self):
@@ -297,160 +319,33 @@ class SaveEveryIteration(InversionDirective):
             )
         return self._fileName
 
-    @fileName.setter
-    def fileName(self, value):
-        self._fileName = value
-
 
 class SaveModelEveryIteration(SaveEveryIteration):
-    """SaveModelEveryIteration"""
+    """SaveModelEveryIteration
+
+    This directive saves the model as a numpy array at each iteration. The
+    default direcroty is the current directoy and the models are saved as
+    `InversionModel-YYYY-MM-DD-HH-MM-iter.npy`
+    """
 
     def initialize(self):
-        print("SimPEG.SaveModelEveryIteration will save your models as: '###-{0!s}.npy'".format(self.fileName))
+        print(
+            "SimPEG.SaveModelEveryIteration will save your models as: "
+            "'{0!s}###-{1!s}.npy'".format(
+                self.directory + os.path.sep, self.fileName
+            )
+        )
 
     def endIter(self):
-        np.save('{0:03d}-{1!s}'.format(
-            self.opt.iter, self.fileName), self.opt.xc
+        np.save(
+            '{0!s}{1:03d}-{2!s}'.format(
+                self.directory + os.path.sep, self.opt.iter, self.fileName
+            ), self.opt.xc
         )
 
 
-class SaveUBCModelEveryIteration(SaveEveryIteration):
-    """SaveModelEveryIteration"""
-
-    replace = True
-    saveComp = True
-    mapping = None
-    vector = False
-
-    def initialize(self):
-
-        if getattr(self, 'mapping', None) is None:
-            return self.mapPair()
-        print("SimPEG.SaveModelEveryIteration will save your models" +
-              " in UBC format as: '###-{0!s}.mod'".format(self.fileName))
-
-    def endIter(self):
-
-        if not self.replace:
-            fileName = self.fileName + "Iter" + str(self.opt.iter)
-        else:
-            fileName = self.fileName
-
-        count = -1
-        for prob, survey, reg in zip(self.prob, self.survey, self.reg.objfcts):
-
-            count += 1
-
-            # if getattr(prob, 'mapping', None) is not None:
-            #     xc = prob.mapping * self.opt.xc
-
-            # else:
-            xc = self.opt.xc
-
-
-            # # Save predicted data
-            # if len(self.prob) > 1:
-            #     Magnetics.writeUBCobs(fileName + "Prob" + str(count) + '.pre', survey, survey.dpred(m=self.opt.xc))
-
-            # else:
-            #     Magnetics.writeUBCobs(fileName + '.pre', survey, survey.dpred(m=self.opt.xc))
-
-            # Save model
-            if not self.vector:
-
-                if isinstance(self.mapping.mesh, Mesh.TreeMesh):
-                        Mesh.TreeMesh.writeUBC(
-                            self.mapping.mesh,
-                            fileName + '.msh',
-                            models={fileName + '.mod': self.mapping * xc}
-                        )
-
-                else:
-                    Mesh.TensorMesh.writeModelUBC(self.mapping.mesh,
-                                              fileName + '.mod', self.mapping * xc)
-            else:
-
-                nC = self.mapping.shape[1]
-
-                if prob.coordinate_system == 'spherical':
-                    vec_xyz = Utils.matutils.atp2xyz(xc.reshape((int(len(xc)/3), 3), order='F'))
-                    theta = xc[nC:2*nC]
-                    phi = xc[2*nC:]
-                else:
-                    vec_xyz = xc
-                    atp = Utils.matutils.xyz2atp(xc.reshape((int(len(xc)/3), 3), order='F'))
-                    theta = atp[nC:2*nC]
-                    phi = atp[2*nC:]
-
-                vec_x = vec_xyz[:nC]
-                vec_y = vec_xyz[nC:2*nC]
-                vec_z = vec_xyz[2*nC:]
-
-                vec = np.c_[vec_x, vec_y, vec_z]
-
-                m_pst = Utils.matutils.xyz2pst(
-                    vec, self.survey[0].srcField.param
-                )
-                m_ind = m_pst.copy()
-                m_ind[:, 1:] = 0.
-                m_ind = Utils.matutils.pst2xyz(
-                    m_ind, self.survey[0].srcField.param
-                )
-
-                m_rem = m_pst.copy()
-                m_rem[:, 0] = 0.
-                m_rem = Utils.matutils.pst2xyz(
-                    m_rem, self.survey[0].srcField.param
-                )
-
-                if self.saveComp:
-                    if isinstance(self.mapping.mesh, Mesh.TreeMesh):
-                        Mesh.TreeMesh.writeUBC(
-                            self.mapping.mesh,
-                            fileName + '.msh',
-                            models={
-                                fileName + '.dip': (self.mapping.P * np.rad2deg(theta)),
-                                fileName + '.azm': self.mapping.P * ((450 - np.rad2deg(phi)) % 360),
-                                fileName + '_TOT.amp': self.mapping.P * np.sum(vec**2, axis=1)**0.5,
-                                fileName + '_IND.amp': self.mapping.P * np.sum(m_ind**2, axis=1)**0.5,
-                                fileName + '_REM.amp': self.mapping.P * np.sum(m_rem**2, axis=1)**0.5 }
-                        )
-
-                        Utils.io_utils.writeVectorUBC(
-                            self.mapping.mesh,
-                            fileName + '.fld',
-                            self.mapping.P * vec
-                        )
-
-                    else:
-                        Mesh.TensorMesh.writeModelUBC(
-                            self.mapping.mesh,
-                            fileName + '.dip', self.mapping.P * (np.rad2deg(theta))
-                        )
-                        Mesh.TensorMesh.writeModelUBC(
-                            self.mapping.mesh,
-                            fileName + '.azm', self.mapping.P * (450 - np.rad2deg(phi)) % 360
-                        )
-                        Mesh.TensorMesh.writeModelUBC(
-                            self.mapping.mesh,
-                            fileName + '_TOT.amp', self.mapping.P * np.sum(vec**2, axis=1)**0.5
-                        )
-                        Mesh.TensorMesh.writeModelUBC(
-                            self.mapping.mesh,
-                            fileName + '_IND.amp', self.mapping.P * np.sum(m_ind**2, axis=1)**0.5
-                        )
-                        Mesh.TensorMesh.writeModelUBC(
-                            self.mapping.mesh,
-                            fileName + '_REM.amp', self.mapping.P * np.sum(m_rem**2, axis=1)**0.5
-                        )
-                        Utils.io_utils.writeVectorUBC(
-                            self.mapping.mesh,
-                            fileName + '_VEC.fld', self.mapping.P * vec
-                        )
-
-
 class SaveOutputEveryIteration(SaveEveryIteration):
-    """SaveModelEveryIteration"""
+    """SaveOutputEveryIteration"""
 
     header = None
     save_txt = True
@@ -474,6 +369,8 @@ class SaveOutputEveryIteration(SaveEveryIteration):
             f.write(self.header)
             f.close()
 
+        # Create a list of each
+
         self.beta = []
         self.phi_d = []
         self.phi_m = []
@@ -484,14 +381,9 @@ class SaveOutputEveryIteration(SaveEveryIteration):
         self.phi = []
 
     def endIter(self):
+
         phi_s, phi_x, phi_y, phi_z = 0, 0, 0, 0
         for reg in self.reg.objfcts:
-
-            # f_m = reg.objfcts[0].f_m
-            # phi_s += np.sum(f_m**2./(f_m**2. + 1e-8)**(1-reg.objfcts[0].norm/2.))
-
-            # f_m = reg.objfcts[1].f_m
-            # phi_x += np.sum(f_m**2./(f_m**2. + 1e-8)**(1-reg.objfcts[1].norm/2.))
             phi_s += (
                 reg.objfcts[0](self.invProb.model) * reg.alpha_s
             )
@@ -499,26 +391,17 @@ class SaveOutputEveryIteration(SaveEveryIteration):
                 reg.objfcts[1](self.invProb.model) * reg.alpha_x
             )
 
-            if reg.regmesh.dim > 1:
-                # f_m = reg.objfcts[2].f_m
-                # phi_x += np.sum(f_m**2./(f_m**2. + 1e-8)**(1-reg.objfcts[2].norm/2.))
+            if reg.regmesh.dim == 2:
                 phi_y += (
                     reg.objfcts[2](self.invProb.model) * reg.alpha_y
                 )
-
-            if reg.regmesh.dim > 2:
-                # f_m = reg.objfcts[3].f_m
-                # phi_x += np.sum(f_m**2./(f_m**2. + 1e-8)**(1-reg.objfcts[3].norm/2.))
-
+            elif reg.regmesh.dim == 3:
+                phi_y += (
+                    reg.objfcts[2](self.invProb.model) * reg.alpha_y
+                )
                 phi_z += (
                     reg.objfcts[3](self.invProb.model) * reg.alpha_z
                 )
-
-            # elif reg.regmesh.dim == 3:
-            #     phi_y += (
-            #         reg.objfcts[2](self.invProb.model) * reg.alpha_y
-            #     )
-
 
         self.beta.append(self.invProb.beta)
         self.phi_d.append(self.invProb.phi_d)
@@ -557,12 +440,7 @@ class SaveOutputEveryIteration(SaveEveryIteration):
         self.phi_m_smooth_y = results[:, 6]
         self.phi_m_smooth_z = results[:, 7]
 
-        if self.reg.regmesh.dim == 1:
-            self.phi_m_smooth = self.phi_m_smooth_x.copy()
-        elif self.reg.regmesh.dim == 2:
-            self.phi_m_smooth = self.phi_m_smooth_x + self.phi_m_smooth_y
-        elif self.reg.regmesh.dim == 3:
-            self.phi_m_smooth = (
+        self.phi_m_smooth = (
                 self.phi_m_smooth_x + self.phi_m_smooth_y + self.phi_m_smooth_z
                 )
 
@@ -577,7 +455,13 @@ class SaveOutputEveryIteration(SaveEveryIteration):
                 i_target += 1
             self.i_target = i_target
 
-    def plot_misfit_curves(self, fname=None, plot_small_smooth=False):
+    def plot_misfit_curves(
+        self, fname=None, dpi=300,
+        plot_small_smooth=False,
+        plot_phi_m=True,
+        plot_small=False,
+        plot_smooth=False
+    ):
 
         self.target_misfit = self.invProb.dmisfit.prob.survey.nD / 2.
         self.i_target = None
@@ -591,22 +475,55 @@ class SaveOutputEveryIteration(SaveEveryIteration):
         fig = plt.figure(figsize=(5, 2))
         ax = plt.subplot(111)
         ax_1 = ax.twinx()
-        ax.semilogy(np.arange(len(self.phi_d)), self.phi_d, 'k-', lw=2)
-        ax_1.semilogy(np.arange(len(self.phi_d)), self.phi_m, 'r', lw=2)
-        if plot_small_smooth:
-            ax_1.semilogy(np.arange(len(self.phi_d)), self.phi_m_small, 'ro')
-            ax_1.semilogy(np.arange(len(self.phi_d)), self.phi_m_smooth, 'rx')
-            ax_1.legend(
-                ("$\phi_m$", "small", "smooth"), bbox_to_anchor=(1.5, 1.)
-                )
+        ax.semilogy(
+            np.arange(len(self.phi_d)),
+            self.phi_d, 'k-', lw=2,
+            label="$\phi_d$"
+        )
 
-        ax.plot(np.r_[ax.get_xlim()[0], ax.get_xlim()[1]], np.ones(2)*self.target_misfit, 'k:')
+        if plot_phi_m:
+            ax_1.semilogy(
+                np.arange(len(self.phi_d)),
+                self.phi_m, 'r', lw=2,
+                label="$\phi_m$"
+            )
+
+        if plot_small_smooth or plot_small:
+            ax_1.semilogy(np.arange(
+                len(self.phi_d)),
+                self.phi_m_small, 'ro',
+                label="small"
+            )
+        if plot_small_smooth or plot_smooth:
+            ax_1.semilogy(np.arange(
+                len(self.phi_d)),
+                self.phi_m_smooth_x, 'rx',
+                label="smooth_x"
+            )
+            ax_1.semilogy(np.arange(
+                len(self.phi_d)),
+                self.phi_m_smooth_y, 'rx',
+                label="smooth_y"
+            )
+            ax_1.semilogy(np.arange(
+                len(self.phi_d)),
+                self.phi_m_smooth_z, 'rx',
+                label="smooth_z"
+            )
+
+        ax.legend(loc=1)
+        ax_1.legend(loc=2)
+
+        ax.plot(np.r_[ax.get_xlim()[0], ax.get_xlim()[1]],
+                np.ones(2) * self.target_misfit, 'k:')
         ax.set_xlabel("Iteration")
         ax.set_ylabel("$\phi_d$")
         ax_1.set_ylabel("$\phi_m$", color='r')
-        for tl in ax_1.get_yticklabels():
-            tl.set_color('r')
+        ax_1.tick_params(axis='y', which='both', colors='red')
+
         plt.show()
+        if fname is not None:
+            fig.savefig(fname, dpi=dpi)
 
     def plot_tikhonov_curves(self, fname=None, dpi=200):
 
@@ -619,25 +536,25 @@ class SaveOutputEveryIteration(SaveEveryIteration):
                 i_target += 1
             self.i_target = i_target
 
-        fig = plt.figure(figsize = (5, 8))
+        fig = plt.figure(figsize=(5, 8))
         ax1 = plt.subplot(311)
         ax2 = plt.subplot(312)
         ax3 = plt.subplot(313)
 
         ax1.plot(self.beta, self.phi_d, 'k-', lw=2, ms=4)
         ax1.set_xlim(np.hstack(self.beta).min(), np.hstack(self.beta).max())
-        ax1.set_xlabel("$\\beta$", fontsize = 14)
-        ax1.set_ylabel("$\phi_d$", fontsize = 14)
+        ax1.set_xlabel("$\\beta$", fontsize=14)
+        ax1.set_ylabel("$\phi_d$", fontsize=14)
 
         ax2.plot(self.beta, self.phi_m, 'k-', lw=2)
         ax2.set_xlim(np.hstack(self.beta).min(), np.hstack(self.beta).max())
-        ax2.set_xlabel("$\\beta$", fontsize = 14)
-        ax2.set_ylabel("$\phi_m$", fontsize = 14)
+        ax2.set_xlabel("$\\beta$", fontsize=14)
+        ax2.set_ylabel("$\phi_m$", fontsize=14)
 
         ax3.plot(self.phi_m, self.phi_d, 'k-', lw=2)
         ax3.set_xlim(np.hstack(self.phi_m).min(), np.hstack(self.phi_m).max())
-        ax3.set_xlabel("$\phi_m$", fontsize = 14)
-        ax3.set_ylabel("$\phi_d$", fontsize = 14)
+        ax3.set_xlabel("$\phi_m$", fontsize=14)
+        ax3.set_ylabel("$\phi_d$", fontsize=14)
 
         if self.i_target is not None:
             ax1.plot(self.beta[self.i_target], self.phi_d[self.i_target], 'k*', ms=10)
@@ -645,12 +562,13 @@ class SaveOutputEveryIteration(SaveEveryIteration):
             ax3.plot(self.phi_m[self.i_target], self.phi_d[self.i_target], 'k*', ms=10)
 
         for ax in [ax1, ax2, ax3]:
-            ax.set_xscale("log")
-            ax.set_yscale("log")
+            ax.set_xscale("linear")
+            ax.set_yscale("linear")
         plt.tight_layout()
         plt.show()
         if fname is not None:
             fig.savefig(fname, dpi=dpi)
+
 
 class SaveOutputDictEveryIteration(SaveEveryIteration):
     """
@@ -660,19 +578,20 @@ class SaveOutputDictEveryIteration(SaveEveryIteration):
     # Initialize the output dict
     outDict = None
     outDict = {}
+    saveOnDisk = False
 
     def initialize(self):
         print("SimPEG.SaveOutputDictEveryIteration will save your inversion progress as dictionary: '###-{0!s}.npz'".format(self.fileName))
 
     def endIter(self):
 
-        regCombo = ["phi_ms", "phi_msx"]
+        # regCombo = ["phi_ms", "phi_msx"]
 
-        if self.prob[0].mesh.dim >= 2:
-            regCombo += ["phi_msy"]
+        # if self.prob[0].mesh.dim >= 2:
+        #     regCombo += ["phi_msy"]
 
-        if self.prob[0].mesh.dim == 3:
-            regCombo += ["phi_msz"]
+        # if self.prob[0].mesh.dim == 3:
+        #     regCombo += ["phi_msz"]
 
         # Initialize the output dict
         iterDict = None
@@ -684,8 +603,8 @@ class SaveOutputDictEveryIteration(SaveEveryIteration):
         iterDict['phi_d'] = self.invProb.phi_d
         iterDict['phi_m'] = self.invProb.phi_m
 
-        for label, fcts in zip(regCombo, self.reg.objfcts[0].objfcts):
-            iterDict[label] = fcts(self.invProb.model)
+        # for label, fcts in zip(regCombo, self.reg.objfcts[0].objfcts):
+        #     iterDict[label] = fcts(self.invProb.model)
 
         iterDict['f'] = self.opt.f
         iterDict['m'] = self.invProb.model
@@ -696,27 +615,25 @@ class SaveOutputDictEveryIteration(SaveEveryIteration):
             iterDict['eps_q'] = self.reg.objfcts[0].eps_q
 
         if hasattr(self.reg.objfcts[0], 'norms') is True:
-            for objfct in self.reg.objfcts[0].objfcts:
-                objfct.stashedR = None
-
             iterDict['lps'] = self.reg.objfcts[0].norms[0][0]
             iterDict['lpx'] = self.reg.objfcts[0].norms[0][1]
 
-        iterDict['dphisdm'] = self.reg.objfcts[0].alpha_s * self.reg.objfcts[0].objfcts[0].deriv(self.invProb.model)
-        iterDict['dphixdm'] = self.reg.objfcts[0].alpha_x * self.reg.objfcts[0].objfcts[1].deriv(self.invProb.model)
-
         # Save the file as a npz
+        if self.saveOnDisk:
+
+            np.savez('{:03d}-{:s}'.format(self.opt.iter, self.fileName), iterDict)
+
         self.outDict[self.opt.iter] = iterDict
 
 
 class Update_IRLS(InversionDirective):
 
-    updateGamma = False
-    f_old = np.inf
+    f_old = 0
     f_min_change = 1e-2
     beta_tol = 1e-1
     beta_ratio_l2 = None
-    prctile = 90
+    prctile = 100
+    chifact_start = 1.
     chifact_target = 1.
 
     # Solving parameter for IRLS (mode:2)
@@ -738,7 +655,6 @@ class Update_IRLS(InversionDirective):
     coolEps_q = True
     floorEps_p = 1e-8
     floorEps_q = 1e-8
-    floorEpsEnforced = True
     coolEpsFact = 1.2
     silent = False
     fix_Jmatrix = False
@@ -758,32 +674,40 @@ class Update_IRLS(InversionDirective):
     def target(self, val):
         self._target = val
 
+    @property
+    def start(self):
+        if getattr(self, '_start', None) is None:
+            if isinstance(self.survey, list):
+                self._start = 0
+                for survey in self.survey:
+                    self._start += survey.nD*0.5*self.chifact_start
+
+            else:
+
+                self._start = self.survey.nD*0.5*self.chifact_start
+        return self._start
+
+    @start.setter
+    def start(self, val):
+        self._start = val
+
     def initialize(self):
 
         if self.mode == 1:
 
             self.norms = []
-            self.alpha = []
             for reg in self.reg.objfcts:
                 self.norms.append(reg.norms)
-                self.alpha.append(reg.alpha_s)
                 reg.norms = np.c_[2., 2., 2., 2.]
                 reg.model = self.invProb.model
 
-                # # Check if using non-simple difference
-                # dx = sp.find(reg.regmesh.cellDiffxStencil)[2].max()
-                # if dx != 1:
-                #     print(dx)
-                #     reg.alpha_s = dx**2. #/np.min(reg.regmesh.mesh.hx)**2.
-
         # Update the model used by the regularization
-        # for reg in self.reg.objfcts:
-        #     reg.model = self.invProb.model
-
         for reg in self.reg.objfcts:
             reg.model = self.invProb.model
+
+        for reg in self.reg.objfcts:
             for comp in reg.objfcts:
-                self.f_old += comp(reg.model)
+                self.f_old += np.sum(comp.f_m**2. / (comp.f_m**2. + comp.epsilon**2.)**(1 - comp.norm/2.))
 
         self.phi_dm = []
         self.phi_dmx = []
@@ -812,10 +736,10 @@ class Update_IRLS(InversionDirective):
             ratio = (self.target / self.invProb.phi_d)
 
             if ratio > 1:
-                ratio = np.min([2.0, ratio])
+                ratio = np.mean([2.0, ratio])
 
             else:
-                ratio = np.max([0.75, ratio])
+                ratio = np.mean([0.75, ratio])
 
             self.invProb.beta = self.invProb.beta * ratio
 
@@ -834,14 +758,11 @@ class Update_IRLS(InversionDirective):
 
         phim_new = 0
         for reg in self.reg.objfcts:
-            reg.model = self.invProb.model
             for comp in reg.objfcts:
-                phim_new += comp(reg.model)
-            # for comp in reg.objfcts:
-            #     phim_new += np.sum(
-            #         comp.f_m**2. /
-            #         (comp.f_m**2. + comp.epsilon**2.)**(1 - comp.norm/2.)
-            #     )
+                phim_new += np.sum(
+                    comp.f_m**2. /
+                    (comp.f_m**2. + comp.epsilon**2.)**(1 - comp.norm/2.)
+                )
 
         # Update the model used by the regularization
         phi_m_last = []
@@ -850,7 +771,7 @@ class Update_IRLS(InversionDirective):
             phi_m_last += [reg(self.invProb.model)]
 
         # After reaching target misfit with l2-norm, switch to IRLS (mode:2)
-        if np.all([self.invProb.phi_d < self.target, self.mode == 1]):
+        if np.all([self.invProb.phi_d < self.start, self.mode == 1]):
             self.startIRLS()
 
         # Only update after GN iterations
@@ -860,7 +781,7 @@ class Update_IRLS(InversionDirective):
         ]):
 
             if self.fix_Jmatrix:
-                print (">> Fix Jmatrix")
+                print(">> Fix Jmatrix")
                 self.invProb.dmisfit.prob.fix_Jmatrix = True
 
             # Check for maximum number of IRLS cycles
@@ -879,14 +800,9 @@ class Update_IRLS(InversionDirective):
 
                 if reg.eps_p > self.floorEps_p and self.coolEps_p:
                     reg.eps_p /= self.coolEpsFact
-
-                elif self.floorEpsEnforced:
-                    reg.eps_p = self.floorEps_p
                     # print('Eps_p: ' + str(reg.eps_p))
                 if reg.eps_q > self.floorEps_q and self.coolEps_q:
                     reg.eps_q /= self.coolEpsFact
-                elif self.floorEpsEnforced:
-                    reg.eps_q = self.floorEps_q
                     # print('Eps_q: ' + str(reg.eps_q))
 
             # Remember the value of the norm from previous R matrices
@@ -961,21 +877,18 @@ class Update_IRLS(InversionDirective):
                                     self.invProb.model)
                                 ), self.prctile
                             )
-                print("Calculated eps_p %e" % reg.eps_p)
+
             if getattr(reg, 'eps_q', None) is None:
 
-                reg.eps_q = reg.eps_p
-                # reg.eps_q = np.percentile(
-                #                 np.abs(reg.objfcts[1].f_m
-                #                 ), self.prctile
-                #             )
-                print("Calculated eps_q %e" % reg.eps_q)
+                reg.eps_q = np.percentile(
+                                np.abs(reg.mapping*reg._delta_m(
+                                    self.invProb.model)
+                                ), self.prctile
+                            )
 
         # Re-assign the norms supplied by user l2 -> lp
-        for reg, norms, alpha in zip(self.reg.objfcts, self.norms, self.alpha):
+        for reg, norms in zip(self.reg.objfcts, self.norms):
             reg.norms = norms
-
-            reg.alpha_s = alpha
 
         # Save l2-model
         self.invProb.l2model = self.invProb.model.copy()
@@ -995,21 +908,14 @@ class Update_IRLS(InversionDirective):
         max_p = []
         for reg in self.reg.objfcts[0].objfcts:
             eps_p = reg.epsilon
-            norm_p = 2  # self.reg.objfcts[0].norms[0]
             f_m = abs(reg.f_m)
             max_p += [np.max(f_m)]
 
         max_p = np.asarray(max_p).max()
 
-        scales = [2*max_p/np.pi, 2*max_p/np.pi]
-        for obj, scale in zip(self.reg.objfcts[1:3], scales):
-            obj.scales = np.ones(obj.scales.shape)*scale
-        # self.reg.objfcts[0].scales = np.ones(self.reg.objfcts[0].scales.shape)
-        # Probably doing rotated obj fun
-        if len(self.reg) > 3:
-
-            for obj, scale in zip(self.reg.objfcts[4:], scales):
-                obj.scales = np.ones(obj.scales.shape)*scale
+        max_s = [np.pi, np.pi]
+        for obj, var in zip(self.reg.objfcts[1:3], max_s):
+            obj.scales = np.ones(obj.scales.shape)*max_p/var
 
     def validate(self, directiveList):
         # check if a linear preconditioner is in the list, if not warn else
@@ -1038,24 +944,17 @@ class UpdatePreconditioner(InversionDirective):
     """
     Create a Jacobi preconditioner for the linear problem
     """
-    onlyOnStart = False
-    mapping = None
-    misfitDiag = None
-    epsilon = 1e-8
+
+    update_every_iteration = True  #: Update every iterations if False
 
     def initialize(self):
 
-        m = self.invProb.model
         # Create the pre-conditioner
         regDiag = np.zeros_like(self.invProb.model)
+        m = self.invProb.model
 
         for reg in self.reg.objfcts:
-            # # Check if regularization has a projection
-            # if getattr(reg.mapping, 'P', None) is None:
-            #     regDiag += (reg.W.T*reg.W).diagonal()
-            # else:
-            #     P = reg.mapping.P
-            #     regDiag += (P.T * (reg.W.T * (reg.W * P))).diagonal()
+            # Check if regularization has a projection
             regDiag += reg.deriv2(m).diagonal()
 
         # Deal with the linear case
@@ -1064,7 +963,6 @@ class UpdatePreconditioner(InversionDirective):
             print("Approximated diag(JtJ) with linear operator")
 
             JtJdiag = np.zeros_like(self.invProb.model)
-            m = self.invProb.model
             for prob, dmisfit in zip(self.prob, self.dmisfit.objfcts):
 
                     if getattr(prob, 'getJtJdiag', None) is None:
@@ -1075,40 +973,59 @@ class UpdatePreconditioner(InversionDirective):
                         JtJdiag += np.sum(np.power((dmisfit.W*prob.getJ(m)), 2), axis=0)
                     else:
                         JtJdiag += prob.getJtJdiag(m, W=dmisfit.W)
+
             self.opt.JtJdiag = JtJdiag
 
         diagA = self.opt.JtJdiag + self.invProb.beta*regDiag
-
         diagA[diagA != 0] = diagA[diagA != 0] ** -1.
-        PC = Utils.sdiag(diagA)
+        PC = Utils.sdiag((diagA))
 
         self.opt.approxHinv = PC
 
     def endIter(self):
-
         # Cool the threshold parameter
-        if self.onlyOnStart is True:
+        if self.update_every_iteration is False:
             return
 
-        m = self.invProb.model
         # Create the pre-conditioner
         regDiag = np.zeros_like(self.invProb.model)
+        m = self.invProb.model
 
         for reg in self.reg.objfcts:
+            # Check if he has wire
             regDiag += reg.deriv2(m).diagonal()
-        #     # Check if he has wire
-        #     if getattr(reg.mapping, 'P', None) is None:
-        #         regDiag += (reg.W.T*reg.W).diagonal()
-        #     else:
-        #         P = reg.mapping.P
-        #         regDiag += (P.T * (reg.W.T * (reg.W * P))).diagonal()
-
         # Assumes that opt.JtJdiag has been updated or static
         diagA = self.opt.JtJdiag + self.invProb.beta*regDiag
-
         diagA[diagA != 0] = diagA[diagA != 0] ** -1.
-        PC = Utils.sdiag(diagA)
+        PC = Utils.sdiag((diagA))
         self.opt.approxHinv = PC
+
+
+class Update_Wj(InversionDirective):
+    """
+        Create approx-sensitivity base weighting using the probing method
+    """
+    k = None  # Number of probing cycles
+    itr = None  # Iteration number to update Wj, or always update if None
+
+    def endIter(self):
+
+        if self.itr is None or self.itr == self.opt.iter:
+
+            m = self.invProb.model
+            if self.k is None:
+                self.k = int(self.survey.nD/10)
+
+            def JtJv(v):
+
+                Jv = self.prob.Jvec(m, v)
+
+                return self.prob.Jtvec(m, Jv)
+
+            JtJdiag = Utils.diagEst(JtJv, len(m), k=self.k)
+            JtJdiag = JtJdiag / max(JtJdiag)
+
+            self.reg.wght = JtJdiag
 
 
 class UpdateSensitivityWeights(InversionDirective):
@@ -1155,20 +1072,18 @@ class UpdateSensitivityWeights(InversionDirective):
             Good for any problem where J is formed explicitely
         """
         self.JtJdiag = []
+        m = self.invProb.model
 
         for prob, dmisfit in zip(
             self.prob,
             self.dmisfit.objfcts
         ):
-            m = self.invProb.model
 
             if getattr(prob, 'getJtJdiag', None) is None:
                 assert getattr(prob, 'getJ', None) is not None, (
                     "Problem does not have a getJ attribute." +
                     "Cannot form the sensitivity explicitely"
                 )
-
-
 
                 self.JtJdiag += [mkvc(np.sum((dmisfit.W*prob.getJ(m))**(2.), axis=0))]
             else:
@@ -1218,7 +1133,7 @@ class UpdateSensitivityWeights(InversionDirective):
         self.opt.JtJdiag = JtJdiag
 
 
-class ProjSpherical(InversionDirective):
+class ProjectSphericalBounds(InversionDirective):
     """
         Trick for spherical coordinate system.
         Project \theta and \phi angles back to [-\pi,\pi] using
@@ -1231,8 +1146,8 @@ class ProjSpherical(InversionDirective):
         # Convert to cartesian than back to avoid over rotation
         nC = int(len(x)/3)
 
-        xyz = Utils.matutils.atp2xyz(x.reshape((nC, 3), order='F'))
-        m = Utils.matutils.xyz2atp(xyz.reshape((nC, 3), order='F'))
+        xyz = Utils.matutils.spherical2cartesian(x.reshape((nC, 3), order='F'))
+        m = Utils.matutils.cartesian2spherical(xyz.reshape((nC, 3), order='F'))
 
         self.invProb.model = m
 
@@ -1247,8 +1162,8 @@ class ProjSpherical(InversionDirective):
         nC = int(len(x)/3)
 
         # Convert to cartesian than back to avoid over rotation
-        xyz = Utils.matutils.atp2xyz(x.reshape((nC, 3), order='F'))
-        m = Utils.matutils.xyz2atp(xyz.reshape((nC, 3), order='F'))
+        xyz = Utils.matutils.spherical2cartesian(x.reshape((nC, 3), order='F'))
+        m = Utils.matutils.cartesian2spherical(xyz.reshape((nC, 3), order='F'))
 
         self.invProb.model = m
 
@@ -1265,167 +1180,537 @@ class ProjSpherical(InversionDirective):
         self.opt.xc = m
 
 
-class JointAmpMVI(InversionDirective):
-    """
-        Directive controlling the joint inversion of
-        magnetic amplitude data and MVI. Use the vector
-        magnetization model (M) to update the linear amplitude
-        operator.
+### Jae edits
+IterationPrinters = Optimization.IterationPrinters
+StoppingCriteria = Optimization.StoppingCriteria
+class SaveOutputEveryIteration_Single(SaveEveryIteration):
+    """SaveModelEveryIteration""" ###### JD edit
 
-    """
-
-    amp = None
-    minGNiter = 1
-    jointMVIS = False
-    updateM = False
+    header = None
+    save_txt = True
+    beta = None
+    phi_d = None
+    phi_m = None
+    phi = None
 
     def initialize(self):
+        if self.save_txt is True:
+            print(
+                "SimPEG.SaveOutputEveryIteration will save your inversion "
+                "progress as: '###-{0!s}.txt'".format(self.fileName)
+            )
+            f = open(self.fileName+'.txt', 'w')
+            self.header = "   #     beta       phi_d       phi_m        phi      cg_iter\n"
+            f.write(self.header)
+            f.close()
 
-        # Get current MVI model and update MAI sensitivity
-        # if isinstance(self.prob, list):
+        self.beta = []
+        self.phi_d = []
+        self.phi_m = []
+        self.phi = []
 
-        m = self.invProb.model.copy()
-        for prob in self.prob:
+    def endIter(self):
+        
+        self.beta.append(self.invProb.beta)
+        self.phi_d.append(self.invProb.phi_d)
+        self.phi_m.append(self.invProb.phi_m)
+        self.phi.append(self.opt.f)
 
-            if isinstance(prob, Magnetics.MagneticVector):
-                if prob.coordinate_system == 'spherical':
-                    xyz = Magnetics.atp2xyz((prob.chiMap * m).reshape((int(len(m)/3), 3), order='F'))
-                    self.jointMVIS = True
-                elif prob.coordinate_system == 'cartesian':
-                    xyz = prob.chiMap * m
+        if self.save_txt:
+            f = open(self.fileName+'.txt', 'a')
+            f.write(
+                ' {0:3d}  {1:1.4e}  {2:1.4e}  {3:1.4e}  {4:1.4e}  {5:3d} \n'.format(
+                    self.opt.iter,
+                    self.beta[self.opt.iter-1],
+                    self.phi_d[self.opt.iter-1],
+                    self.phi_m[self.opt.iter-1],
+                    self.phi[self.opt.iter-1],
+                    self.opt.cg_count
+                )
+            )
+            f.close()
 
-            if isinstance(prob, Magnetics.MagneticAmplitude):
-                self.amp = prob.chiMap * m
+    def load_results(self):
+        results = np.loadtxt(self.fileName+str(".txt"), comments="#")
+        self.beta = results[:, 1]
+        self.phi_d = results[:, 2]
+        self.phi_m = results[:, 3]
 
-        for prob in self.prob:
-            if isinstance(prob, Magnetics.MagneticAmplitude):
-                if self.jointMVIS:
-                    prob.jointMVIS = True
+        self.f = results[:, 4]
 
-                nC = prob.mesh.nC
+        self.target_misfit = self.invProb.dmisfit.prob.survey.nD / 2.
+        self.i_target = None
 
-                mcol = xyz.reshape((nC, 3), order='F')
-                amp = np.sum(mcol**2., axis=1)**0.5
-                M = Utils.sdiag(1./amp) * mcol
+        if self.invProb.phi_d < self.target_misfit:
+            i_target = 0
+            while self.phi_d[i_target] > self.target_misfit:
+                i_target += 1
+            self.i_target = i_target
 
-        else:
-            assert("This directive needs to used on a ComboObjective")
+    def plot_misfit_curves(self, fname=None, plot_small_smooth=False):
+
+        self.target_misfit = self.invProb.dmisfit.prob.survey.nD / 2.
+        self.i_target = None
+
+        if self.invProb.phi_d < self.target_misfit:
+            i_target = 0
+            while self.phi_d[i_target] > self.target_misfit:
+                i_target += 1
+            self.i_target = i_target
+
+        plt.figure(figsize=(5, 2))
+        ax = plt.subplot(111)
+        ax_1 = ax.twinx()
+        ax.semilogy(np.arange(len(self.phi_d)), self.phi_d, 'k-', lw=2)
+        ax_1.semilogy(np.arange(len(self.phi_d)), self.phi_m, 'r', lw=2)
+
+        ax.plot(np.r_[ax.get_xlim()[0], ax.get_xlim()[1]], np.ones(2)*self.target_misfit, 'k:')
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("$\phi_d$")
+        ax_1.set_ylabel("$\phi_m$", color='r')
+        for tl in ax_1.get_yticklabels():
+            tl.set_color('r')
+        plt.show()
+
+    def plot_tikhonov_curves(self, fname=None, dpi=200):
+
+        self.target_misfit = self.invProb.dmisfit.prob.survey.nD / 2.
+        self.i_target = None
+
+        if self.invProb.phi_d < self.target_misfit:
+            i_target = 0
+            while self.phi_d[i_target] > self.target_misfit:
+                i_target += 1
+            self.i_target = i_target
+
+        fig = plt.figure(figsize = (5, 8))
+        ax1 = plt.subplot(311)
+        ax2 = plt.subplot(312)
+        ax3 = plt.subplot(313)
+
+        ax1.plot(self.beta, self.phi_d, 'k-', lw=2, ms=4)
+        ax1.set_xlim(np.hstack(self.beta).min(), np.hstack(self.beta).max())
+        ax1.set_xlabel("$\\beta$", fontsize = 14)
+        ax1.set_ylabel("$\phi_d$", fontsize = 14)
+
+        ax2.plot(self.beta, self.phi_m, 'k-', lw=2)
+        ax2.set_xlim(np.hstack(self.beta).min(), np.hstack(self.beta).max())
+        ax2.set_xlabel("$\\beta$", fontsize = 14)
+        ax2.set_ylabel("$\phi_m$", fontsize = 14)
+
+        ax3.plot(self.phi_m, self.phi_d, 'k-', lw=2)
+        ax3.set_xlim(np.hstack(self.phi_m).min(), np.hstack(self.phi_m).max())
+        ax3.set_xlabel("$\phi_m$", fontsize = 14)
+        ax3.set_ylabel("$\phi_d$", fontsize = 14)
+
+        if self.i_target is not None:
+            ax1.plot(self.beta[self.i_target], self.phi_d[self.i_target], 'k*', ms=10)
+            ax2.plot(self.beta[self.i_target], self.phi_m[self.i_target], 'k*', ms=10)
+            ax3.plot(self.phi_m[self.i_target], self.phi_d[self.i_target], 'k*', ms=10)
+
+        for ax in [ax1, ax2, ax3]:
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+        plt.tight_layout()
+        plt.show()
+        if fname is not None:
+            fig.savefig(fname, dpi=dpi)
+            
+            
+class RatioX(InversionDirective):
+    '''
+        Directive for setting RatioX StoppingCriteria. 
+        Computes the percentage change of the current model from the previous model.
+        
+        ..math::
+        \frac {\| \mathbf{m_i} - \mathbf{m_{i-1}} \|} {\| \mathbf{m_{i-1}} \|}
+        
+    '''
+    tol_ratioX=1e-5
+    tol_dmis = 1e-1
+    chifact_target = 1.
+    
+    @property
+    def target(self):
+        if getattr(self, '_target', None) is None:
+            nD = 0
+            for survey in self.survey:
+                nD += survey.nD
+
+            self._target = nD*0.5*self.chifact_target
+
+        return self._target
+
+    @target.setter
+    def target(self, val):
+        self._target = val
+    
+    def endIter(self):
+#        criteria_1 = np.abs(1. - self.invProb.phi_d / self.target) < self.tol_dmis
+        criteria_1 = True
+        criteria_2 = norm(self.opt.xc - self.opt.x_last) / norm(self.opt.x_last) < self.tol_ratioX
+        if np.all([criteria_1, criteria_2]):
+            print("stopping criteria met: ", norm(self.opt.xc - self.opt.x_last) 
+                                            / norm(self.opt.x_last))
+            self.opt.stopNextIteration = True
+
+
+class JointInversion_Directive(InversionDirective):
+    '''
+        Directive for joint inversions. Sets Printers and StoppingCriteria.
+        
+        Methods assume we are working with two models.
+    '''
+    class JointInversionPrinters(IterationPrinters):
+        betas = {
+            "title": "betas", "value": lambda M: ["{:.2e}".format(elem) 
+            for elem in M.parent.betas], "width": 26,
+            "format":   "%s"
+        }
+        lambd = {
+            "title": "lambda", "value": lambda M: M.parent.lambd, "width": 10,
+            "format":   "%1.2e"
+        }
+        phi_d_joint = {
+            "title": "phi_d", "value": lambda M: ["{:.2e}".format(elem) 
+            for elem in M.parent.phi_d_joint], "width": 26,
+            "format":   "%s"
+        }
+        phi_m_joint = {
+            "title": "phi_m", "value": lambda M: ["{:.2e}".format(elem) 
+            for elem in M.parent.phi_m_joint], "width": 26,
+            "format":   "%s"
+        }
+        phi_c = {
+            "title": "phi_c", "value": lambda M: M.parent.phi_c, "width": 10,
+            "format":   "%1.2e"
+        }
+        ratio_x = {
+            "title": "ratio_x", "value": lambda M: 1 if M.iter==0 else norm(M.xc-M.x_last) / norm(M.x_last),
+            "width": 10, "format": "%1.2e"
+        }        
+        iterationCG = {
+            "title": "iterCG", "value": lambda M: M.cg_count, "width": 10, "format": "%3d"
+        }
+        
+    printers = [
+            IterationPrinters.iteration, JointInversionPrinters.betas, 
+            JointInversionPrinters.lambd, IterationPrinters.f, 
+            JointInversionPrinters.phi_d_joint, JointInversionPrinters.phi_m_joint,
+            JointInversionPrinters.phi_c, JointInversionPrinters.iterationCG, 
+            JointInversionPrinters.ratio_x
+        ]
+        
+    def initialize(self):
+        ### define relevant attributes
+        self.betas = self.reg.multipliers[:-1]
+        self.lambd = self.reg.multipliers[-1]
+        self.phi_d_joint = []
+        self.phi_m_joint = []
+        self.phi_c = 0.0
+        
+        ### pass attributes to invProb
+        self.invProb.betas = self.betas
+        self.invProb.num_models = len(self.betas)
+        self.invProb.lambd = self.lambd
+        self.invProb.phi_d_joint = self.phi_d_joint
+        self.invProb.phi_m_joint = self.phi_m_joint
+        self.invProb.phi_c = self.phi_c
+        
+        self.opt.printers = self.printers
+        self.opt.stoppers = [StoppingCriteria.iteration]
+    
+    def validate(self, directiveList):
+        # check that this directive is first in the DirectiveList
+        dList = directiveList.dList
+        self_ind = dList.index(self)
+        assert(self_ind==0), ('The JointInversion_Directive must be first.')
+        
+        return True
+    
+    def endIter(self):
+        ### compute attribute values
+        phi_d = []
+        for dmis in self.dmisfit.objfcts:
+            phi_d.append(dmis(self.opt.xc))
+            
+        phi_m = []
+        for reg in self.reg.objfcts:
+            phi_m.append(reg(self.opt.xc))
+        
+        ### pass attributes values to invProb
+        ### Assume last reg.objfct is the coupling
+        self.invProb.phi_d_joint = phi_d
+        self.invProb.phi_m_joint = phi_m[:-1]
+        self.invProb.phi_c = phi_m[-1]
+        self.invProb.betas = self.reg.multipliers[:-1]
+        self.invProb.lambd = self.reg.multipliers[-1]
+            
+            
+class SaveOutputEveryIteration_JointInversion(SaveEveryIteration, InversionDirective):
+    '''
+    SaveOutputEveryIteration for Joint Inversions.
+    Saves information on the tradeoff parameters, data misfits, regularizations,
+    coupling term, number of CG iterations, and value of cost function.
+    '''
+    header = None
+    save_txt = True
+    betas = None
+    phi_d = None
+    phi_m = None
+    phi_c = None
+    phi = None
+
+    def initialize(self):
+        if self.save_txt is True:
+            print(
+                "SimPEG.SaveOutputEveryIteration will save your inversion "
+                "progress as: '###-{0!s}.txt'".format(self.fileName)
+            )
+            f = open(self.fileName+'.txt', 'w')
+            self.header = "  #          betas            lambda         joint_phi_d                joint_phi_m            phi_c       iterCG     phi    \n"
+            f.write(self.header)
+            f.close()
+
+        # Create a list of each
+
+        self.betas = []
+        self.lambd = []
+        self.phi_d = []
+        self.phi_m = []
+        self.phi = []
+        self.phi_c = []
 
     def endIter(self):
 
-        # Get current MVI model and update magnetization model for MAI
-        m = self.invProb.model.copy()
-        for prob in self.prob:
+        self.betas.append(["{:.2e}".format(elem) for elem in self.invProb.betas])
+        self.phi_d.append(["{:.3e}".format(elem) for elem in self.invProb.phi_d_joint])
+        self.phi_m.append(["{:.3e}".format(elem) for elem in self.invProb.phi_m_joint])
+        self.lambd.append("{:.2e}".format(self.invProb.lambd))
+        self.phi_c.append(self.invProb.phi_c)
+        self.phi.append(self.opt.f)
 
-            if isinstance(prob, Magnetics.MagneticVector):
-                if prob.coordinate_system == 'spherical':
-                    xyz = Magnetics.atp2xyz((prob.chiMap * m).reshape((int(len(m)/3), 3), order='F'))
+        if self.save_txt:
+            f = open(self.fileName+'.txt', 'a')
+            f.write(
+                    ' {0:2d} {1} {2} {3} {4} {5:1.4e}    {6:d}    {7:1.4e}\n'.format(
+                        self.opt.iter,
+                        self.betas[self.opt.iter-1],
+                        self.lambd[self.opt.iter-1],
+                        self.phi_d[self.opt.iter-1],
+                        self.phi_m[self.opt.iter-1],
+                        self.phi_c[self.opt.iter-1],
+                        self.opt.cg_count,
+                        self.phi[self.opt.iter-1] )
+                    )
+            f.close()
 
-                elif prob.coordinate_system == 'cartesian':
-                    xyz = prob.chiMap * m
+    def load_results(self):
+        results = np.loadtxt(self.fileName+str(".txt"), comments="#")
+        self.betas = results[:, 1]
+        self.lambd = results[:, 2]
+        self.phi_d = results[:, 3]
+        self.phi_m = results[:, 4]
+        self.phi_c = results[:, 5]
+        self.f = results[:, 7]
+            
 
-            if isinstance(prob, Magnetics.MagneticAmplitude):
-                if prob.chiMap.shape[0] == 3*prob.mesh.nC:
+class BetaCooling_Joint(InversionDirective):
+    '''
+        Directive for beta cooling schedule to determine the tradeoff 
+        parameters of the joint inverse problem.
+        We borrow some code from Update_IRLS.
+    '''
+    chifact_target = 1.
+    beta_tol = 1e-1
+    updateBeta = True
+    coolingRate = 1
+    coolingFactor = 2
+    beta_initial_estimate = True
+    beta_ratio = 1
+    dmis_met = False
+    
+    @property
+    def target(self):
+        if getattr(self, '_target', None) is None:
+            nD = []
+            for survey in self.survey:
+                nD += [survey.nD]
+            nD = np.array(nD)
 
-                    nC = prob.mesh.nC
+            self._target = nD*0.5*self.chifact_target
 
-                    mcol = (prob.chiMap * m).reshape((nC, 3), order='F')
-                    self.amp = np.sum(mcol**2., axis=1)**0.5
+        return self._target
+
+    @target.setter
+    def target(self, val):
+        self._target = val
+        
+    def estimate_betas_eig(self, beta_ratio):
+        '''
+            Estimate initial betas by eigen values.
+            Method uses one iteration of the Power Method to estimate
+            eigenvectors for each separate inverse problem.
+        '''
+        m = self.invProb.model
+        f = self.invProb.getFields(m, store=True, deleteWarmstart=False)
+        
+        # Fix the seed for random vector for consistent results
+        np.random.seed(0)
+        x0 = np.random.rand(*m.shape)
+        
+        t = []
+        b = []
+        i_count = 0
+        betas = []
+        # assume dmisfit and reg are combo objective functions.
+        # assume last regularization object is the coupling
+        for dmis, reg in zip(self.dmisfit.objfcts, self.reg.objfcts[:-1]):
+            t.append(x0.dot(dmis.deriv2(m, x0, f=f[i_count])))
+            b.append(x0.dot(reg.deriv2(m, x0, f=f)))
+            i_count += 1
+        
+        t = np.array(t)
+        b = np.array(b)
+        
+        betas = beta_ratio*(t/b)
+        self.betas = betas
+        self.invProb.betas = self.betas
+        self.reg.multipliers[:-1] = self.invProb.betas
+                
+    def initialize(self):
+            
+        if self.beta_initial_estimate:
+            self.estimate_betas_eig(self.beta_ratio)
+        
+        self.dmis_met = np.zeros_like(self.betas, dtype=int)
+        self.dmis_met = self.dmis_met.astype(bool)
+            
+    def endIter(self):
+        
+        # Check if target misfit has been reached, if so, set dmis_met to True
+        for i in range(self.invProb.num_models):
+            if self.invProb.phi_d_joint[i] < self.target[i]:
+                self.dmis_met[i] = True
+        
+        # check separately if misfits are within the tolerance,
+        # otherwise, scale beta individually
+        for i in range(self.invProb.num_models):
+            if np.all([np.abs(1. - self.invProb.phi_d_joint[i] / self.target[i]) > self.beta_tol,
+                      self.updateBeta, self.dmis_met[i], self.opt.iter%self.coolingRate==0]):
+                ratio = self.target[i] / self.invProb.phi_d_joint[i]
+                if ratio>1:
+                    ratio = np.minimum(1.5, ratio)
                 else:
-
-                    self.amp = prob.chiMap * m
-
-        for prob in self.prob:
-            if np.all([isinstance(prob, Magnetics.MagneticAmplitude), self.updateM]):
-
-                nC = prob.mesh.nC
-
-                mcol = xyz.reshape((nC, 3), order='F')
-                amp = np.sum(mcol**2., axis=1)**0.5
-
-                M = Utils.sdiag(1./amp) * mcol
-
-                prob.M = M
-                prob._Mxyz = None
-                prob.Mxyz
-                # if prob.model is None:
-                #     prob.model = prob.chiMap * m
-
-                # ampW = (amp/amp.max() + 1e-2)**-1.
-                # prob.W = ampW
-
-            if isinstance(prob, Magnetics.MagneticVector):
-
-                if (prob.coordinate_system == 'cartesian') and (self.amp is not None):
-
-                    ampW = (self.amp/self.amp.max()+1e-2)**-1.
-                    ampW = np.r_[ampW, ampW, ampW]
-
-                    # Scale max values
-                    scale = np.abs(xyz).max()/self.amp.max()
-                    # print('Scale: '+str(scale))
-                    prob.W = ampW
+                    ratio = np.maximum(0.75, ratio)
+                
+                self.invProb.betas[i] = self.invProb.betas[i] * ratio
+                
+            elif np.all([self.opt.iter%self.coolingRate==0, self.dmis_met[i] == False]):
+                self.invProb.betas[i] = self.invProb.betas[i] / self.coolingFactor
+                
+        self.reg.multipliers[:-1] = self.invProb.betas
 
 
-class UpdateApproxJtJ(InversionDirective):
-    """
-        Create approx-sensitivity base weighting using the probing method
-    """
-    k = None  # Number of probing cycles
-    itr = None  # Iteration number to update Wj, or always update if None
-
-    def endIter(self):
-
-        if self.itr is None or self.itr == self.opt.iter:
-
-            m = self.invProb.model
-            if self.k is None:
-
-                nD = 0
-                for survey in self.survey:
-                    nD += survey.nD
-
-                self.k = int(nD/10)
-
-            def JtJv(v):
-
-                Jv = self.prob.Jvec(m, v)
-
-                return self.prob.Jtvec(m, Jv)
-
-            JtJdiag = Utils.diagEst(JtJv, len(m), k=self.k)
-            JtJdiag = JtJdiag / max(JtJdiag)
-
-            self.reg.wght = JtJdiag
-
-
-class ScaleComboReg(InversionDirective):
-    """
-    Directive to take care of re-weighting
-    the non-linear magnetic problems.
-
-    """
-    # coordinate_system = 'Amp'
-    # test = False
-    mapping = None
-    ComboRegFun = False
-    ComboMisfitFun = False
-    JtJdiag = None
-    everyIter = True
-
+class LambdaIncrease_Joint(BetaCooling_Joint):
+    '''
+        Will increase weight of coupling term.
+    '''
+    lambd = 0 # default weight for coupling term
+    tol_ratioX = 1e-5
+    lambd_factor = 10
+    joint_inversions = False # indicator to show if currently running joint inversions
+    dmis_criteria = []
+    
     def initialize(self):
-
-        # for reg in self.reg.objfcts:
-        m = self.invProb.model
-
-        scale = np.abs(self.reg.objfcts[0](m)).max()/np.abs(self.reg.objfcts[1](m)).max()
-        print("Initial scale: " + str(scale))
-        self.reg.objfcts[1].scale = scale
-
+        self.reg.multipliers[-1] = self.lambd
+        self.invProb.lambd = self.lambd
+        self.dmis_criteria = np.zeros_like(self.invProb.betas, dtype=int)
+        self.dmis_criteria = self.dmis_criteria.astype(bool)
+    
     def endIter(self):
+            
+        if norm(self.opt.xc - self.opt.x_last) / norm(self.opt.x_last) < self.tol_ratioX:
+            print("norm(xc-x_last) / norm(x_last): ", norm(self.opt.xc - self.opt.x_last) / norm(self.opt.x_last))
+            if not self.joint_inversions:
+                # initiate joint inversions
+                self.joint_inversions = True
+                
+                # store model from single inversion
+                self.invProb.single_m = self.invProb.model.copy()
+                self.invProb.previous_m = self.invProb.model.copy()
+                
+                # determine initial lambda value
+                power = np.ceil(np.log10(self.invProb.phi_c))
+                self.lambd = 10**(-power) # set initial value for lambda
+                self.invProb.lambd = self.lambd
+                self.reg.multipliers[-1] = self.lambd
+                print("starting joint inversions with lambda = {:.4e}".format(self.lambd))
+            else:
+                self.lambd = self.lambd*self.lambd_factor
+                self.invProb.lambd = self.lambd
+                self.reg.multipliers[-1] = self.lambd
+                print("continue joint inversions with lambda = {:.4e}".format(self.lambd))
+                
+            # check if data misfit is within tolerance
+            for i in range(self.invProb.num_models):
+                if np.abs(1. - self.invProb.phi_d_joint[i] / self.target[i]) < self.beta_tol:
+                    self.dmis_criteria[i] = True
+                else:
+                    self.dmis_criteria[i] = False
+                
+            if np.all(self.dmis_criteria):
+                self.invProb.previous_m = self.invProb.model.copy()
+                return
+            else:
+                self.opt.xc = self.invProb.previous_m
+                self.opt.stopNextIteration = True
+                print("ending joint inversions")
 
-        m = self.invProb.model
 
-        scale = np.abs(self.reg.objfcts[0].deriv(m)).max()/np.abs(self.reg.objfcts[1].deriv(m)).max()
-        print("Initial scale: " + str(scale))
-        self.reg.objfcts[1].scale = scale
+class BetaCooling(InversionDirective):
+    '''
+        Directive for beta cooling schedule to determine the tradeoff 
+        parameters of the joint inverse problem.
+        We borrow some code from Update_IRLS.
+    '''
+    chifact_target = 1.
+    beta_tol = 1e-1
+    updateBeta = True
+    coolingRate = 1
+    coolingFactor = 2
+    dmis_met = False
+    
+    @property
+    def target(self):
+        if getattr(self, '_target', None) is None:
+            nD = 0
+            for survey in self.survey:
+                nD += survey.nD
+
+            self._target = nD*0.5*self.chifact_target
+
+        return self._target
+
+    @target.setter
+    def target(self, val):
+        self._target = val
+            
+    def endIter(self):
+        
+        if self.invProb.phi_d < self.target:
+            self.dmis_met = True
+            
+        if np.all([np.abs(1. - self.invProb.phi_d / self.target) > self.beta_tol,
+                  self.updateBeta, self.dmis_met, self.opt.iter%self.coolingRate==0]):
+            ratio = self.target / self.invProb.phi_d
+            if ratio>1:
+                ratio = np.minimum(1.5, ratio)
+            else:
+                ratio = np.maximum(0.75, ratio)
+            
+            self.invProb.beta = self.invProb.beta * ratio
+            
+        elif np.all([self.opt.iter%self.coolingRate==0, self.dmis_met == False]):
+            self.invProb.beta = self.invProb.beta / self.coolingFactor
+    
