@@ -1212,9 +1212,9 @@ class SaveOutputEveryIteration_Single(SaveEveryIteration):
     def endIter(self):
         
         self.beta.append(self.invProb.beta)
-        self.phi_d.append(self.invProb.phi_d)
-        self.phi_m.append(self.invProb.phi_m)
-        self.phi.append(self.opt.f)
+        self.phi_d.append(np.asscalar(self.invProb.phi_d))
+        self.phi_m.append(np.asscalar(self.invProb.phi_m))
+        self.phi.append(np.asscalar(self.opt.f))
 
         if self.save_txt:
             f = open(self.fileName+'.txt', 'a')
@@ -1703,7 +1703,7 @@ class BetaCooling(InversionDirective):
             
         if np.all([np.abs(1. - self.invProb.phi_d / self.target) > self.beta_tol,
                   self.updateBeta, self.dmis_met, self.opt.iter%self.coolingRate==0]):
-            ratio = self.target / self.invProb.phi_d
+            ratio = np.asscalar(self.target / self.invProb.phi_d)
             if ratio>1:
                 ratio = np.minimum(1.5, ratio)
             else:
