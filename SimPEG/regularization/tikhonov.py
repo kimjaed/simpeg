@@ -356,7 +356,7 @@ class SmoothDeriv(BaseRegularization):
         if self.cell_weights is not None:
             vol *= self.cell_weights
 
-        D = Utils.sdiag(self.length_scales) * getattr(
+        D = getattr(
             self.regmesh,
             "cellDiff{orientation}".format(
                 orientation=self.orientation
@@ -366,28 +366,6 @@ class SmoothDeriv(BaseRegularization):
         Ave = getattr(self.regmesh, 'aveCC2F{}'.format(self.orientation))
 
         return Utils.sdiag(np.sqrt(Ave * vol)) * D
-    
-    @property
-    def length_scales(self):
-        """
-            Normalized cell based weighting
-        """
-        if getattr(self, '_length_scales', None) is None:
-            Ave = getattr(self.regmesh, 'aveCC2F{}'.format(self.orientation))
-
-            index = 'xyz'.index(self.orientation)
-
-            length_scales = Ave * (
-                self.regmesh.Pac.T*self.regmesh.mesh.h_gridded[:, index]
-            )
-
-            self._length_scales = length_scales.min() / length_scales
-
-        return self._length_scales
-
-    @length_scales.setter
-    def length_scales(self, value):
-        self._length_scales = value
 
 
 class SmoothDeriv2(BaseRegularization):
