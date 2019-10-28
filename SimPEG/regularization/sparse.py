@@ -171,6 +171,7 @@ class SparseDeriv(BaseSparse):
     """
 
     def __init__(self, mesh, orientation='x', **kwargs):
+        self.length_scales = None
         self.orientation = orientation
         super(SparseDeriv, self).__init__(mesh=mesh, **kwargs)
 
@@ -251,16 +252,18 @@ class SparseDeriv(BaseSparse):
             maxVal[self.norm < 1] = (
                 self.epsilon / np.sqrt(1.-self.norm[self.norm < 1])
             )
-            maxGrad = (
-                maxVal /
-                (maxVal**2. + (self.epsilon*self.length_scales)**2.)**(1.-self.norm/2.)
-            )
+#            maxGrad = (
+#                maxVal /
+#                (maxVal**2. + (self.epsilon*self.length_scales)**2.)**(1.-self.norm/2.)
+#            )
+            maxGrad = maxVal / (maxVal**2. + (self.epsilon)**2.)**(1.-self.norm/2.)
 
             # Scaling Factor
             eta[maxGrad != 0] = np.abs(f_m).max()/maxGrad[maxGrad != 0]
 
         # Scaled-IRLS weights
-        r = (eta / (f_m**2. + (self.epsilon*self.length_scales)**2.)**(1.-self.norm/2.))**0.5
+#        r = (eta / (f_m**2. + (self.epsilon*self.length_scales)**2.)**(1.-self.norm/2.))**0.5
+        r = (eta / (f_m**2. + (self.epsilon)**2.)**(1.-self.norm/2.))**0.5
         self.stashedR = r  # stash on the first calculation
         return r
 
