@@ -5,6 +5,7 @@ from SimPEG.Utils import mkvc
 from SimPEG import Props
 import scipy as sp
 import scipy.constants as constants
+import multiprocessing
 import os
 import time
 import numpy as np
