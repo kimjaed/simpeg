@@ -14,6 +14,7 @@ import properties
 from SimPEG.Utils import mkvc, matutils, sdiag
 from . import BaseMag as MAG
 from .MagAnalytics import spheremodel, CongruousMagBC
+import time
 
 
 class MagneticIntegral(Problem.LinearProblem):
@@ -95,12 +96,15 @@ class MagneticIntegral(Problem.LinearProblem):
             raise Exception('Need to pair!')
 
         if getattr(self, '_G', None) is None:
-
+            print("Begin forward: M=" + self.magType + ", Rx type= " + self.rx_type)
+            start = time.time()
             if self.modelType == 'vector':
                 self.magType = 'full'
 
             self._G = self.Intrgl_Fwr_Op(magType=self.magType,
                                          rx_type=self.rx_type)
+            
+            print("Linear forward calculation ended in: " + str(time.time()-start) + " sec")
 
         return self._G
 
@@ -380,7 +384,7 @@ class MagneticIntegral(Problem.LinearProblem):
             raise Exception('magType must be: "H0" or "full"')
 
                 # Loop through all observations and create forward operator (nD-by-nC)
-        print("Begin forward: M=" + magType + ", Rx type= " + self.rx_type)
+#        print("Begin forward: M=" + magType + ", Rx type= " + self.rx_type)
 
         # Switch to determine if the process has to be run in parallel
         job = Forward(
