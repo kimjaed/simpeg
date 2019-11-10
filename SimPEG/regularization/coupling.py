@@ -157,13 +157,12 @@ class CrossGradient(BaseCoupling):
         
         return gradient_vector
         
-    def construct_norm_vectors(self, m1, m2, fltr=True, fltr_per=0.05):
+    def construct_norm_vectors(self, model, fltr=True, fltr_per=0.05):
         '''
         Computes the norms of the gradients for two models.
         
-        :param numpy.ndarray m1: model1
-        :param numpy.ndarray m2: model2
-        :param bool reduced_space: if True, return only norms of active cells.
+        :param numpy.ndarray model: stacked array of individual models
+                                    np.c_[model1, model2,...]
         :param bool fltr: if True, filter out predefined percentage of lowest norms.
         :param float fltr_per: Percentage of lowest norms to be filtered out.
                                Default is 0.05
@@ -174,6 +173,9 @@ class CrossGradient(BaseCoupling):
                 norms_2: np.array containing reciprocals of the gradient norms for model2
                 tot_norms: np.array containing element-wise product of norms_1 and norms_2.
         '''
+        m1 = self.map1*model
+        m2 = self.map2*model
+        
         per = int(fltr_per*self.regmesh.nC)
         
         if self.regmesh.mesh.dim == 2:
@@ -229,18 +231,20 @@ class CrossGradient(BaseCoupling):
                 
         return norm_gradients
 
-    def calculate_cross_gradient(self, m1, m2, normalized=False):
+    def calculate_cross_gradient(self, model, normalized=False):
         '''
         Calculates the cross-gradients of two models at each cell center.
         
-        :param numpy.ndarray m1: model1
-        :param numpy.ndarray m2: model2
+        :param numpy.ndarray model: stacked array of individual models
+                                    np.c_[model1, model2,...]
         :param bool normalized: normalizes gradients if True
         
         :rtype: numpy.ndarray
         :returns: array where at each location, we've computed the cross-product
                   of the gradients of two models.
         '''
+        m1 = self.map1*model
+        m2 = self.map2*model
         m1, m2 = self.models([m1,m2])
         
         ### Compute the gradients and concatenate components.
@@ -308,7 +312,7 @@ class CrossGradient(BaseCoupling):
             result = term1 - term2
             
             if normalized:
-                norms1, norms2, norms = self.construct_norm_vectors(m1, m2, fltr=False)
+                norms1, norms2, norms = self.construct_norm_vectors(model, fltr=False)
                 temp1 = (Dx_m1*norms1)**2 + (Dy_m1*norms1)**2
                 temp2 = (Dx_m2*norms2)**2 + (Dy_m2*norms2)**2
                 term1 = temp1.dot(temp2)
@@ -330,7 +334,7 @@ class CrossGradient(BaseCoupling):
             result = term1 - term2
             
             if normalized:
-                norms1, norms2, norms = self.construct_norm_vectors(m1, m2, fltr=False)
+                norms1, norms2, norms = self.construct_norm_vectors(model, fltr=False)
                 temp1 = (Dx_m1*norms1)**2 + (Dy_m1*norms1)**2 + (Dz_m1*norms1)**2
                 temp2 = (Dx_m2*norms2)**2 + (Dy_m2*norms2)**2 + (Dz_m2*norms2)**2
                 term1 = temp1.dot(temp2)

@@ -1580,8 +1580,10 @@ class BetaCooling_Joint(InversionDirective):
                 
     def initialize(self):
             
-        if self.beta_initial_estimate:
+        if self.beta_initial_estimate or np.any(self.invProb.betas==0):
             self.estimate_betas_eig(self.beta_ratio)
+        else:
+            self.betas = self.invProb.betas
         
         self.dmis_met = np.zeros_like(self.betas, dtype=int)
         self.dmis_met = self.dmis_met.astype(bool)
@@ -1640,6 +1642,9 @@ class LambdaIncrease_Joint(BetaCooling_Joint):
                 self.invProb.single_m = self.invProb.model.copy()
                 self.invProb.previous_m = self.invProb.model.copy()
                 
+                # store value of cross-gradients
+                self.phi_c_previous = self.invProb.phi_c
+                
                 # determine initial lambda value
                 power = np.ceil(np.log10(self.invProb.phi_c))
                 self.lambd = 10**(-power) # set initial value for lambda
@@ -1659,8 +1664,11 @@ class LambdaIncrease_Joint(BetaCooling_Joint):
                 else:
                     self.dmis_criteria[i] = False
                 
-            if np.all(self.dmis_criteria):
+            if np.all(self.dmis_criteria + [self.invProb.phi_c / self.phi_c_previous <= 1.]):
                 self.invProb.previous_m = self.invProb.model.copy()
+                self.opt.xc = self.invProb.single_m
+                # store value of cross-gradients
+                self.phi_c_previous = self.invProb.phi_c 
                 return
             else:
                 self.opt.xc = self.invProb.previous_m
