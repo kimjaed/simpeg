@@ -1361,6 +1361,8 @@ class JointInversion_Directive(InversionDirective):
         
         Methods assume we are working with two models.
     '''
+    normalized = False # set True if want to see normalized coupling values
+    
     class JointInversionPrinters(IterationPrinters):
         betas = {
             "title": "betas", "value": lambda M: ["{:.2e}".format(elem) 
@@ -1385,6 +1387,10 @@ class JointInversion_Directive(InversionDirective):
             "title": "phi_c", "value": lambda M: M.parent.phi_c, "width": 10,
             "format":   "%1.2e"
         }
+        phi_c_n = {
+            "title": "phi_c_n", "value": lambda M: M.parent.phi_c_n, "width": 10,
+            "format":   "%1.2e"
+        }
         ratio_x = {
             "title": "ratio_x", "value": lambda M: 1 if M.iter==0 else norm(M.xc-M.x_last) / norm(M.x_last),
             "width": 10, "format": "%1.2e"
@@ -1403,19 +1409,24 @@ class JointInversion_Directive(InversionDirective):
         
     def initialize(self):
         ### define relevant attributes
-        self.betas = self.reg.multipliers[:-1]
-        self.lambd = self.reg.multipliers[-1]
-        self.phi_d_joint = []
-        self.phi_m_joint = []
-        self.phi_c = 0.0
+        betas = self.reg.multipliers[:-1]
+        lambd = self.reg.multipliers[-1]
+        phi_d_joint = []
+        phi_m_joint = []
+        phi_c = 0.0
         
         ### pass attributes to invProb
-        self.invProb.betas = self.betas
-        self.invProb.num_models = len(self.betas)
-        self.invProb.lambd = self.lambd
-        self.invProb.phi_d_joint = self.phi_d_joint
-        self.invProb.phi_m_joint = self.phi_m_joint
-        self.invProb.phi_c = self.phi_c
+        self.invProb.betas = betas
+        self.invProb.num_models = len(betas)
+        self.invProb.lambd = lambd
+        self.invProb.phi_d_joint = phi_d_joint
+        self.invProb.phi_m_joint = phi_m_joint
+        self.invProb.phi_c = phi_c
+        
+        if self.normalized:
+            phi_c_n = 0.0
+            self.invProb.phi_c_n = phi_c_n
+            self.printers.insert(7, self.JointInversionPrinters.phi_c_n)
         
         self.opt.printers = self.printers
         self.opt.stoppers = [StoppingCriteria.iteration]
@@ -1445,6 +1456,10 @@ class JointInversion_Directive(InversionDirective):
         self.invProb.phi_c = phi_m[-1]
         self.invProb.betas = self.reg.multipliers[:-1]
         self.invProb.lambd = self.reg.multipliers[-1]
+        
+        if self.normalized:
+            reg = self.reg.objfcts[-1]
+            self.invProb.phi_c_n = reg(self.opt.xc, normalized=True)
             
             
 class SaveOutputEveryIteration_JointInversion(SaveEveryIteration, InversionDirective):
@@ -1460,6 +1475,7 @@ class SaveOutputEveryIteration_JointInversion(SaveEveryIteration, InversionDirec
     phi_m = None
     phi_c = None
     phi = None
+    normalized = False
 
     def initialize(self):
         if self.save_txt is True:
@@ -1468,7 +1484,10 @@ class SaveOutputEveryIteration_JointInversion(SaveEveryIteration, InversionDirec
                 "progress as: '###-{0!s}.txt'".format(self.fileName)
             )
             f = open(self.fileName+'.txt', 'w')
-            self.header = "  #          betas            lambda         joint_phi_d                joint_phi_m            phi_c       iterCG     phi    \n"
+            if self.normalized:
+                self.header = "  #          betas            lambda         joint_phi_d                joint_phi_m            phi_c      phi_c_n   iterCG     phi    \n"
+            else:
+                self.header = "  #          betas            lambda         joint_phi_d                joint_phi_m            phi_c    iterCG     phi    \n"
             f.write(self.header)
             f.close()
 
@@ -1480,6 +1499,9 @@ class SaveOutputEveryIteration_JointInversion(SaveEveryIteration, InversionDirec
         self.phi_m = []
         self.phi = []
         self.phi_c = []
+        
+        if self.normalized:
+            self.phi_c_n = []
 
     def endIter(self):
 
@@ -1489,21 +1511,39 @@ class SaveOutputEveryIteration_JointInversion(SaveEveryIteration, InversionDirec
         self.lambd.append("{:.2e}".format(self.invProb.lambd))
         self.phi_c.append(self.invProb.phi_c)
         self.phi.append(self.opt.f)
+        
+        if self.normalized:
+            self.phi_c_n.append(self.invProb.phi_c_n)
 
         if self.save_txt:
             f = open(self.fileName+'.txt', 'a')
-            f.write(
-                    ' {0:2d} {1} {2} {3} {4} {5:1.4e}    {6:d}    {7:1.4e}\n'.format(
-                        self.opt.iter,
-                        self.betas[self.opt.iter-1],
-                        self.lambd[self.opt.iter-1],
-                        self.phi_d[self.opt.iter-1],
-                        self.phi_m[self.opt.iter-1],
-                        self.phi_c[self.opt.iter-1],
-                        self.opt.cg_count,
-                        self.phi[self.opt.iter-1] )
-                    )
-            f.close()
+            if self.normalized:
+                f.write(
+                        ' {0:2d} {1} {2} {3} {4} {5:1.4e}  {6:1.4e}   {7:d}    {8:1.4e}\n'.format(
+                            self.opt.iter,
+                            self.betas[self.opt.iter-1],
+                            self.lambd[self.opt.iter-1],
+                            self.phi_d[self.opt.iter-1],
+                            self.phi_m[self.opt.iter-1],
+                            self.phi_c[self.opt.iter-1],
+                            self.phi_c_n[self.opt.iter-1],
+                            self.opt.cg_count,
+                            self.phi[self.opt.iter-1] )
+                        )
+                f.close()
+            else:
+                f.write(
+                        ' {0:2d} {1} {2} {3} {4} {5:1.4e}   {6:d}    {7:1.4e}\n'.format(
+                            self.opt.iter,
+                            self.betas[self.opt.iter-1],
+                            self.lambd[self.opt.iter-1],
+                            self.phi_d[self.opt.iter-1],
+                            self.phi_m[self.opt.iter-1],
+                            self.phi_c[self.opt.iter-1],
+                            self.opt.cg_count,
+                            self.phi[self.opt.iter-1] )
+                        )
+                f.close()
 
     def load_results(self):
         results = np.loadtxt(self.fileName+str(".txt"), comments="#")
