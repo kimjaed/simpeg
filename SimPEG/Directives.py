@@ -1632,7 +1632,7 @@ class BetaCooling_Joint(InversionDirective):
         
         # Check if target misfit has been reached, if so, set dmis_met to True
         for i in range(self.invProb.num_models):
-            if self.invProb.phi_d_joint[i] < self.target[i]:
+            if np.abs(1. - self.invProb.phi_d_joint[i] / self.target[i]) < self.beta_tol:
                 self.dmis_met[i] = True
         
         # check separately if misfits are within the tolerance,
@@ -1746,7 +1746,7 @@ class BetaCooling(InversionDirective):
             
     def endIter(self):
         
-        if self.invProb.phi_d < self.target:
+        if np.abs(1. - self.invProb.phi_d / self.target) < self.beta_tol:
             self.dmis_met = True
             
         if np.all([np.abs(1. - self.invProb.phi_d / self.target) > self.beta_tol,
