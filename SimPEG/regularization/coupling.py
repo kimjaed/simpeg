@@ -70,7 +70,8 @@ class CrossGradient(BaseCoupling):
     ..math::
         \phi_c(\mathbf{m_1},\mathbf{m_2}) = \lambda \sum_{i=1}^{M} \| 
         \nabla \mathbf{m_1}_i \times \nabla \mathbf{m_2}_i \|^2
-
+    
+    The current version of the code only works with TensorMesh.
     All methods assume that we are working with two models only.
     '''
     def __init__(self, mesh, indActive, mapping, **kwargs):
